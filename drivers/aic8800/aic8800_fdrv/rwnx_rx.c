@@ -2168,6 +2168,14 @@ void rwnx_rxdata_process_amsdu(struct rwnx_hw *rwnx_hw, struct sk_buff *skb, u8 
         sub_skb = NULL;
         while (skb->len > 16) {
             sublen = (skb->data[12]<<8)|(skb->data[13]);
+            /* The subframe body must hold the 6-byte LLC/SNAP prefix that is
+             * stripped below plus the EtherType; a smaller length makes
+             * sublen - 6 negative and the copy below overflow sub_skb.
+             */
+            if (sublen < 8) {
+                printk("amsdu: invalid subframe len %u\n", sublen);
+                break;
+            }
             if (skb->len > (sublen+14))
                 len_alligned = roundup(sublen + 14, 4);
             else if (skb->len == (sublen+14))
@@ -2191,7 +2199,7 @@ void rwnx_rxdata_process_amsdu(struct rwnx_hw *rwnx_hw, struct sk_buff *skb, u8 
             rwnx_vif = rwnx_rx_get_vif(rwnx_hw, vif_idx);
             if (!rwnx_vif) {
                 printk("frame received but no active vif (%d), skb->len:%u\n", vif_idx, skb->len);
-                //dev_kfree_skb(sub_skb);
+                dev_kfree_skb(sub_skb);
                 break;
             }
             __skb_queue_tail(list, sub_skb);
