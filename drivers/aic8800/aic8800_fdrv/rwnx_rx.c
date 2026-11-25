@@ -2224,6 +2224,7 @@ void defrag_timeout_cb(struct timer_list *t)
 #endif
 {
 	struct defrag_ctrl_info *defrag_ctrl = NULL;
+	struct rwnx_hw *rwnx_hw;
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
 	defrag_ctrl = (struct defrag_ctrl_info *)data;
 #elif LINUX_VERSION_CODE < KERNEL_VERSION(6,16,0)
@@ -2233,11 +2234,12 @@ void defrag_timeout_cb(struct timer_list *t)
 #endif
 
 	printk("%s:%p\r\n", __func__, defrag_ctrl);
-	spin_lock_bh(&defrag_ctrl->rwnx_hw->defrag_lock);
+	rwnx_hw = defrag_ctrl->rwnx_hw;
+	spin_lock_bh(&rwnx_hw->defrag_lock);
 	list_del_init(&defrag_ctrl->list);
 	dev_kfree_skb(defrag_ctrl->skb);
 	kfree(defrag_ctrl);
-	spin_unlock_bh(&defrag_ctrl->rwnx_hw->defrag_lock);
+	spin_unlock_bh(&rwnx_hw->defrag_lock);
 }
 
 extern void rwnx_data_dump(char* tag, void* data, unsigned long len);
@@ -2628,6 +2630,15 @@ check_len_update:
 							return 0;
 						}
 
+						if (skb->len - (pull_len - 8) > skb_tailroom(defrag_info->skb)) {
+							/* Too large for the reassembly buffer; the stale
+							 * entry is dropped by defrag_timeout_cb.
+							 */
+							printk("defrag overflow:%u\n", skb->len);
+							dev_kfree_skb(skb);
+							spin_unlock_bh(&rwnx_hw->defrag_lock);
+							return 0;
+						}
 						skb_put(defrag_info->skb, skb->len-(pull_len-8));
 						memcpy(&defrag_info->skb->data[defrag_info->frm_len], \
 								&skb->data[pull_len-8], skb->len - (pull_len-8));
@@ -2638,14 +2649,14 @@ check_len_update:
 						spin_unlock_bh(&rwnx_hw->defrag_lock);
 						return 0;
 					} else {
-						defrag_info = kzalloc(sizeof(struct defrag_ctrl_info), GFP_KERNEL);
+						defrag_info = kzalloc(sizeof(struct defrag_ctrl_info), GFP_ATOMIC);
 						if (defrag_info == NULL) {
 							printk("no defrag_ctrl_info\r\n");
 							dev_kfree_skb(skb);
 							spin_unlock_bh(&rwnx_hw->defrag_lock);
 							return 0;
 						}
-						defrag_info->skb = __dev_alloc_skb(2000, GFP_KERNEL);
+						defrag_info->skb = __dev_alloc_skb(2000, GFP_ATOMIC);
 						if (defrag_info->skb == NULL) {
 							printk("no fragment skb\r\n");
 							dev_kfree_skb(skb);
@@ -2659,6 +2670,14 @@ check_len_update:
 						memcpy(skb->data, ra, MAC_ADDR_LEN);
 						memcpy(&skb->data[6], ta, MAC_ADDR_LEN);
 						memcpy(&skb->data[12], ether_type, 2);
+						if (skb->len > skb_tailroom(defrag_info->skb)) {
+							printk("defrag overflow:%u\n", skb->len);
+							dev_kfree_skb(skb);
+							dev_kfree_skb(defrag_info->skb);
+							kfree(defrag_info);
+							spin_unlock_bh(&rwnx_hw->defrag_lock);
+							return 0;
+						}
 						defrag_info->sn = seq_num;
 						defrag_info->next_fn = 1;
 						defrag_info->tid = tid;
@@ -2704,6 +2723,12 @@ check_len_update:
 								return 0;
 							}
 
+							if (skb->len - (pull_len - 8) > skb_tailroom(defrag_info->skb)) {
+								printk("defrag overflow:%u\n", skb->len);
+								dev_kfree_skb(skb);
+								spin_unlock_bh(&rwnx_hw->defrag_lock);
+								return 0;
+							}
 							skb_put(defrag_info->skb, skb->len - (pull_len-8));
 							memcpy(&defrag_info->skb->data[defrag_info->frm_len], \
 										&skb->data[pull_len-8], skb->len - (pull_len-8));
@@ -2722,14 +2747,20 @@ check_len_update:
 
 							skb_tmp = defrag_info->skb;
 							list_del_init(&defrag_info->list);
-							if (timer_pending(&defrag_info->defrag_timer)) {
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0))
-								ret = timer_delete(&defrag_info->defrag_timer);
+							ret = timer_delete(&defrag_info->defrag_timer);
 #else
-								ret = del_timer(&defrag_info->defrag_timer);
+							ret = del_timer(&defrag_info->defrag_timer);
 #endif
+							if (ret) {
+								kfree(defrag_info);
+							} else {
+								/* defrag_timeout_cb already fired and is waiting
+								 * for defrag_lock; it frees defrag_info, so only
+								 * take the reassembled skb away from it.
+								 */
+								defrag_info->skb = NULL;
 							}
-							kfree(defrag_info);
 							spin_unlock_bh(&rwnx_hw->defrag_lock);
 
 							if (!rwnx_rx_data_skb(rwnx_hw, rwnx_vif, skb_tmp, hw_rxhdr))
