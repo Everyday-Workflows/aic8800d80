@@ -1442,20 +1442,31 @@ void arpoffload_proc(struct sk_buff *skb, struct rwnx_vif *rwnx_vif)
     struct iphdr *iphead = (struct iphdr *)(skb->data);
     struct udphdr *udph;
     struct DHCPInfo *dhcph;
+    unsigned int ihl, udp_len;
 
-    if(skb->protocol == htons(ETH_P_IP)) { // IP
+    if(skb->protocol == htons(ETH_P_IP) && skb_headlen(skb) >= sizeof(struct iphdr)) { // IP
         if(iphead->protocol == IPPROTO_UDP) { // UDP
-            udph = (struct udphdr *)((u8 *)iphead + (iphead->ihl << 2));
+            ihl = iphead->ihl << 2;
+            if (ihl < sizeof(struct iphdr) ||
+                skb_headlen(skb) < ihl + sizeof(struct udphdr) + offsetof(struct DHCPInfo, options))
+                return;
+            udph = (struct udphdr *)((u8 *)iphead + ihl);
             if((udph->source == __constant_htons(SERVER_PORT))
                 && (udph->dest == __constant_htons(CLIENT_PORT))) { // DHCP offset/ack
                 AICWFDBG(LOGDEBUG, "dhcp: offer / ack\n");
                 dhcph =	(struct DHCPInfo *)((u8 *)udph + sizeof(struct udphdr));
                 if(dhcph->cookie == htonl(DHCP_MAGIC) && dhcph->op == 2 &&
                     !memcmp(dhcph->chaddr, rwnx_vif->ndev->dev_addr, 6)) { // match magic word
-                    u32 length = ntohs(udph->len) - sizeof(struct udphdr) - offsetof(struct DHCPInfo, options);
-                    u16 offset = 0;
+                    u32 length;
+                    u32 offset = 0;
                     u8 *option = dhcph->options;
-                    while (option[offset]!= DHCP_OPTION_END && offset<length) {
+
+                    udp_len = ntohs(udph->len);
+                    if (udp_len < sizeof(struct udphdr) + offsetof(struct DHCPInfo, options) ||
+                        udp_len > skb_headlen(skb) - ihl)
+                        return;
+                    length = udp_len - sizeof(struct udphdr) - offsetof(struct DHCPInfo, options);
+                    while (offset + 2 < length && option[offset] != DHCP_OPTION_END) {
                         if (option[offset] == DHCP_OPTION_MESSAGE_TYPE) {
                             if (option[offset+2] == DHCP_ACK) {
                                 AICWFDBG(LOGDEBUG, "dhcp:   ack\n");
