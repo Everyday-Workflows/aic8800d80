@@ -323,6 +323,10 @@ static int aic_priv_cmd_set_tx (struct rwnx_hw *rwnx_hw, int argc, char *argv[],
 			lvl_mod = 1;
 		else if (settx_param.mode == 5)
 			lvl_mod = 2;
+		else {
+			AICWFDBG(LOGERROR, "no power level table for mode %d\n", settx_param.mode);
+			return -EINVAL;
+		}
 		if (settx_param.mode >= 4)
 			lvl_idx = settx_param.rate & 0xF;
 		else if (settx_param.mode >= 2)

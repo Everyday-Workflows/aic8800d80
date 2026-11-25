@@ -807,8 +807,16 @@ static inline int rwnx_rx_scanu_result_ind(struct rwnx_hw *rwnx_hw,
 			}
 		}
 			scan_re_wext = (struct scanu_result_wext *)vmalloc(sizeof(struct scanu_result_wext));
+			if (!scan_re_wext)
+				goto putbss;
 			scan_re_wext->ind = (struct scanu_result_ind *)vmalloc(sizeof(struct scanu_result_ind));
 			scan_re_wext->payload = (u32_l *)vmalloc(sizeof(u32_l) * ind->length);
+			if (!scan_re_wext->ind || !scan_re_wext->payload) {
+				vfree(scan_re_wext->payload);
+				vfree(scan_re_wext->ind);
+				vfree(scan_re_wext);
+				goto putbss;
+			}
 
 			memset(scan_re_wext->ind, 0, sizeof(struct scanu_result_ind));
 			memset(scan_re_wext->payload, 0, ind->length);

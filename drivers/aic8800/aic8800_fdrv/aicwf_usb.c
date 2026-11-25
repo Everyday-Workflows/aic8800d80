@@ -1816,6 +1816,8 @@ static int aicwf_usb_bus_txdata(struct device *dev, struct sk_buff *skb)
     usb_fill_bulk_urb(usb_buf->urb, usb_dev->udev, usb_dev->bulk_out_pipe,
                 usb_buf->usb_align_data + (align_param - align), buf_len, aicwf_usb_tx_complete, usb_buf);
 #else
+    /* Send the original buffer if the bounce buffer cannot be allocated. */
+    buf_align = buf;
     if (!IS_ALIGNED((unsigned long)buf, align_param)) {
         usb_buf->usb_align_data = (u8*)kmalloc(sizeof(u8) * buf_len + align_param, GFP_ATOMIC);
         if (usb_buf->usb_align_data) {
@@ -1823,8 +1825,6 @@ static int aicwf_usb_bus_txdata(struct device *dev, struct sk_buff *skb)
             buf_align = usb_buf->usb_align_data + (align_param - align);
             memcpy(buf_align, buf, buf_len);
         }
-    } else {
-        buf_align = buf;
     }
 
     usb_fill_bulk_urb(usb_buf->urb, usb_dev->udev, usb_dev->bulk_out_pipe,

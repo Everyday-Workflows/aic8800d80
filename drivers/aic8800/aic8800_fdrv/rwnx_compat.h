@@ -28,6 +28,11 @@
 #define AICWF_CFG80211_VERSION_CODE LINUX_VERSION_CODE
 #endif
 
+/* The fallthrough pseudo-keyword was added in Linux 5.4. */
+#ifndef fallthrough
+#define fallthrough do {} while (0) /* fallthrough */
+#endif
+
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3, 10, 0)
 #error "Minimum kernel version supported is 3.10"
 #endif

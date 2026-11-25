@@ -618,7 +618,7 @@ int rwnx_send_add_if(struct rwnx_hw *rwnx_hw, const unsigned char *mac,
     //case NL80211_IFTYPE_P2P_DEVICE:
     case NL80211_IFTYPE_P2P_CLIENT:
         add_if_req_param->p2p = true;
-        // no break
+        fallthrough;
     #endif /* CONFIG_RWNX_FULLMAC */
     case NL80211_IFTYPE_STATION:
         add_if_req_param->type = MM_STA;
@@ -631,7 +631,7 @@ int rwnx_send_add_if(struct rwnx_hw *rwnx_hw, const unsigned char *mac,
     #ifdef CONFIG_RWNX_FULLMAC
     case NL80211_IFTYPE_P2P_GO:
         add_if_req_param->p2p = true;
-        // no break
+        fallthrough;
     #endif /* CONFIG_RWNX_FULLMAC */
     case NL80211_IFTYPE_AP:
         add_if_req_param->type = MM_AP;
@@ -4254,14 +4254,14 @@ int rwnx_send_apm_start_cac_req(struct rwnx_hw *rwnx_hw, struct rwnx_vif *vif,
         return -ENOMEM;
 
     /* Set parameters for the APM_START_CAC_REQ message */
-	req->vif_idx = vif->vif_index;
-	req->chan.band = chandef->chan->band;
-	req->chan.type = bw2chnl[chandef->width];
-	req->chan.prim20_freq = chandef->chan->center_freq;
-	req->chan.center1_freq = chandef->center_freq1;
-	req->chan.center2_freq = chandef->center_freq2;
-	req->chan.tx_power = 20;
-	req->chan.flags = get_chan_flags(chandef->chan->flags);
+    req->vif_idx = vif->vif_index;
+    req->chan.band = chandef->chan->band;
+    req->chan.type = bw2chnl[chandef->width];
+    req->chan.prim20_freq = chandef->chan->center_freq;
+    req->chan.center1_freq = chandef->center_freq1;
+    req->chan.center2_freq = chandef->center_freq2;
+    req->chan.tx_power = 20;
+    req->chan.flags = get_chan_flags(chandef->chan->flags);
 #ifdef CONFIG_RADAR_OR_IR_DETECT
 	rwnx_hw->radar.status = RWNX_RADAR_CAC_BUSY;
 	AICWFDBG(LOGINFO, "DFS: radar st = %d\n", rwnx_hw->radar.status);

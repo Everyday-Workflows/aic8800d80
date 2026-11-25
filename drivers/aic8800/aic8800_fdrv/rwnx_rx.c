@@ -1442,20 +1442,31 @@ void arpoffload_proc(struct sk_buff *skb, struct rwnx_vif *rwnx_vif)
     struct iphdr *iphead = (struct iphdr *)(skb->data);
     struct udphdr *udph;
     struct DHCPInfo *dhcph;
+    unsigned int ihl, udp_len;
 
-    if(skb->protocol == htons(ETH_P_IP)) { // IP
+    if(skb->protocol == htons(ETH_P_IP) && skb_headlen(skb) >= sizeof(struct iphdr)) { // IP
         if(iphead->protocol == IPPROTO_UDP) { // UDP
-            udph = (struct udphdr *)((u8 *)iphead + (iphead->ihl << 2));
+            ihl = iphead->ihl << 2;
+            if (ihl < sizeof(struct iphdr) ||
+                skb_headlen(skb) < ihl + sizeof(struct udphdr) + offsetof(struct DHCPInfo, options))
+                return;
+            udph = (struct udphdr *)((u8 *)iphead + ihl);
             if((udph->source == __constant_htons(SERVER_PORT))
                 && (udph->dest == __constant_htons(CLIENT_PORT))) { // DHCP offset/ack
                 AICWFDBG(LOGDEBUG, "dhcp: offer / ack\n");
                 dhcph =	(struct DHCPInfo *)((u8 *)udph + sizeof(struct udphdr));
                 if(dhcph->cookie == htonl(DHCP_MAGIC) && dhcph->op == 2 &&
                     !memcmp(dhcph->chaddr, rwnx_vif->ndev->dev_addr, 6)) { // match magic word
-                    u32 length = ntohs(udph->len) - sizeof(struct udphdr) - offsetof(struct DHCPInfo, options);
-                    u16 offset = 0;
+                    u32 length;
+                    u32 offset = 0;
                     u8 *option = dhcph->options;
-                    while (option[offset]!= DHCP_OPTION_END && offset<length) {
+
+                    udp_len = ntohs(udph->len);
+                    if (udp_len < sizeof(struct udphdr) + offsetof(struct DHCPInfo, options) ||
+                        udp_len > skb_headlen(skb) - ihl)
+                        return;
+                    length = udp_len - sizeof(struct udphdr) - offsetof(struct DHCPInfo, options);
+                    while (offset + 2 < length && option[offset] != DHCP_OPTION_END) {
                         if (option[offset] == DHCP_OPTION_MESSAGE_TYPE) {
                             if (option[offset+2] == DHCP_ACK) {
                                 AICWFDBG(LOGDEBUG, "dhcp:   ack\n");
@@ -2168,6 +2179,14 @@ void rwnx_rxdata_process_amsdu(struct rwnx_hw *rwnx_hw, struct sk_buff *skb, u8 
         sub_skb = NULL;
         while (skb->len > 16) {
             sublen = (skb->data[12]<<8)|(skb->data[13]);
+            /* The subframe body must hold the 6-byte LLC/SNAP prefix that is
+             * stripped below plus the EtherType; a smaller length makes
+             * sublen - 6 negative and the copy below overflow sub_skb.
+             */
+            if (sublen < 8) {
+                printk("amsdu: invalid subframe len %u\n", sublen);
+                break;
+            }
             if (skb->len > (sublen+14))
                 len_alligned = roundup(sublen + 14, 4);
             else if (skb->len == (sublen+14))
@@ -2191,7 +2210,7 @@ void rwnx_rxdata_process_amsdu(struct rwnx_hw *rwnx_hw, struct sk_buff *skb, u8 
             rwnx_vif = rwnx_rx_get_vif(rwnx_hw, vif_idx);
             if (!rwnx_vif) {
                 printk("frame received but no active vif (%d), skb->len:%u\n", vif_idx, skb->len);
-                //dev_kfree_skb(sub_skb);
+                dev_kfree_skb(sub_skb);
                 break;
             }
             __skb_queue_tail(list, sub_skb);
@@ -2216,6 +2235,7 @@ void defrag_timeout_cb(struct timer_list *t)
 #endif
 {
 	struct defrag_ctrl_info *defrag_ctrl = NULL;
+	struct rwnx_hw *rwnx_hw;
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
 	defrag_ctrl = (struct defrag_ctrl_info *)data;
 #elif LINUX_VERSION_CODE < KERNEL_VERSION(6,16,0)
@@ -2225,11 +2245,12 @@ void defrag_timeout_cb(struct timer_list *t)
 #endif
 
 	printk("%s:%p\r\n", __func__, defrag_ctrl);
-	spin_lock_bh(&defrag_ctrl->rwnx_hw->defrag_lock);
+	rwnx_hw = defrag_ctrl->rwnx_hw;
+	spin_lock_bh(&rwnx_hw->defrag_lock);
 	list_del_init(&defrag_ctrl->list);
 	dev_kfree_skb(defrag_ctrl->skb);
 	kfree(defrag_ctrl);
-	spin_unlock_bh(&defrag_ctrl->rwnx_hw->defrag_lock);
+	spin_unlock_bh(&rwnx_hw->defrag_lock);
 }
 
 extern void rwnx_data_dump(char* tag, void* data, unsigned long len);
@@ -2620,6 +2641,15 @@ check_len_update:
 							return 0;
 						}
 
+						if (skb->len - (pull_len - 8) > skb_tailroom(defrag_info->skb)) {
+							/* Too large for the reassembly buffer; the stale
+							 * entry is dropped by defrag_timeout_cb.
+							 */
+							printk("defrag overflow:%u\n", skb->len);
+							dev_kfree_skb(skb);
+							spin_unlock_bh(&rwnx_hw->defrag_lock);
+							return 0;
+						}
 						skb_put(defrag_info->skb, skb->len-(pull_len-8));
 						memcpy(&defrag_info->skb->data[defrag_info->frm_len], \
 								&skb->data[pull_len-8], skb->len - (pull_len-8));
@@ -2630,14 +2660,14 @@ check_len_update:
 						spin_unlock_bh(&rwnx_hw->defrag_lock);
 						return 0;
 					} else {
-						defrag_info = kzalloc(sizeof(struct defrag_ctrl_info), GFP_KERNEL);
+						defrag_info = kzalloc(sizeof(struct defrag_ctrl_info), GFP_ATOMIC);
 						if (defrag_info == NULL) {
 							printk("no defrag_ctrl_info\r\n");
 							dev_kfree_skb(skb);
 							spin_unlock_bh(&rwnx_hw->defrag_lock);
 							return 0;
 						}
-						defrag_info->skb = __dev_alloc_skb(2000, GFP_KERNEL);
+						defrag_info->skb = __dev_alloc_skb(2000, GFP_ATOMIC);
 						if (defrag_info->skb == NULL) {
 							printk("no fragment skb\r\n");
 							dev_kfree_skb(skb);
@@ -2651,6 +2681,14 @@ check_len_update:
 						memcpy(skb->data, ra, MAC_ADDR_LEN);
 						memcpy(&skb->data[6], ta, MAC_ADDR_LEN);
 						memcpy(&skb->data[12], ether_type, 2);
+						if (skb->len > skb_tailroom(defrag_info->skb)) {
+							printk("defrag overflow:%u\n", skb->len);
+							dev_kfree_skb(skb);
+							dev_kfree_skb(defrag_info->skb);
+							kfree(defrag_info);
+							spin_unlock_bh(&rwnx_hw->defrag_lock);
+							return 0;
+						}
 						defrag_info->sn = seq_num;
 						defrag_info->next_fn = 1;
 						defrag_info->tid = tid;
@@ -2696,6 +2734,12 @@ check_len_update:
 								return 0;
 							}
 
+							if (skb->len - (pull_len - 8) > skb_tailroom(defrag_info->skb)) {
+								printk("defrag overflow:%u\n", skb->len);
+								dev_kfree_skb(skb);
+								spin_unlock_bh(&rwnx_hw->defrag_lock);
+								return 0;
+							}
 							skb_put(defrag_info->skb, skb->len - (pull_len-8));
 							memcpy(&defrag_info->skb->data[defrag_info->frm_len], \
 										&skb->data[pull_len-8], skb->len - (pull_len-8));
@@ -2710,22 +2754,32 @@ check_len_update:
 								spin_unlock_bh(&rwnx_hw->defrag_lock);
 								return 0;
 							}
-							dev_kfree_skb(skb);
-
 							skb_tmp = defrag_info->skb;
 							list_del_init(&defrag_info->list);
-							if (timer_pending(&defrag_info->defrag_timer)) {
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0))
-								ret = timer_delete(&defrag_info->defrag_timer);
+							ret = timer_delete(&defrag_info->defrag_timer);
 #else
-								ret = del_timer(&defrag_info->defrag_timer);
+							ret = del_timer(&defrag_info->defrag_timer);
 #endif
+							if (ret) {
+								kfree(defrag_info);
+							} else {
+								/* defrag_timeout_cb already fired and is waiting
+								 * for defrag_lock; it frees defrag_info, so only
+								 * take the reassembled skb away from it.
+								 */
+								defrag_info->skb = NULL;
 							}
-							kfree(defrag_info);
 							spin_unlock_bh(&rwnx_hw->defrag_lock);
 
-							if (!rwnx_rx_data_skb(rwnx_hw, rwnx_vif, skb_tmp, hw_rxhdr))
+							/* hw_rxhdr points into skb, so free skb only after
+							 * rwnx_rx_data_skb() has read the RX header.
+							 * rwnx_rxdata_process_amsdu() frees skb_tmp itself.
+							 */
+							if (!rwnx_rx_data_skb(rwnx_hw, rwnx_vif, skb_tmp, hw_rxhdr) &&
+							    !hw_rxhdr->flags_is_amsdu)
 								dev_kfree_skb(skb_tmp);
+							dev_kfree_skb(skb);
 
 							return 0;
 						}
