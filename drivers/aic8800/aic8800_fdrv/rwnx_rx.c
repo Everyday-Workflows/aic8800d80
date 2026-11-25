@@ -2754,8 +2754,6 @@ check_len_update:
 								spin_unlock_bh(&rwnx_hw->defrag_lock);
 								return 0;
 							}
-							dev_kfree_skb(skb);
-
 							skb_tmp = defrag_info->skb;
 							list_del_init(&defrag_info->list);
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0))
@@ -2774,8 +2772,14 @@ check_len_update:
 							}
 							spin_unlock_bh(&rwnx_hw->defrag_lock);
 
-							if (!rwnx_rx_data_skb(rwnx_hw, rwnx_vif, skb_tmp, hw_rxhdr))
+							/* hw_rxhdr points into skb, so free skb only after
+							 * rwnx_rx_data_skb() has read the RX header.
+							 * rwnx_rxdata_process_amsdu() frees skb_tmp itself.
+							 */
+							if (!rwnx_rx_data_skb(rwnx_hw, rwnx_vif, skb_tmp, hw_rxhdr) &&
+							    !hw_rxhdr->flags_is_amsdu)
 								dev_kfree_skb(skb_tmp);
+							dev_kfree_skb(skb);
 
 							return 0;
 						}
