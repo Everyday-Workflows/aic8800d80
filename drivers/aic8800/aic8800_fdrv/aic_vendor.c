@@ -112,15 +112,19 @@ static int aicwf_vendor_start_mkeep_alive(struct wiphy *wiphy, struct wireless_d
 			break;
 		case MKEEP_ALIVE_ATTRIBUTE_IP_PKT_LEN:
 			ip_pkt_len = nla_get_u16(iter);
-			if (ip_pkt_len > MKEEP_ALIVE_IP_PKT_MAX) {
+			if (ip_pkt_len > MKEEP_ALIVE_IP_PKT_MAX || ip_pkt) {
 				ret = -EINVAL;
 				goto exit;
 			}
 			break;
 		case MKEEP_ALIVE_ATTRIBUTE_IP_PKT:
-			if (!ip_pkt_len) {
+			/* The payload must cover the announced length; a second
+			 * IP_PKT or a later IP_PKT_LEN would desync ip_pkt_len
+			 * from the buffer.
+			 */
+			if (!ip_pkt_len || ip_pkt || nla_len(iter) < ip_pkt_len) {
 				ret = -EINVAL;
-				printk("ip packet length is 0\n");
+				printk("invalid ip packet attribute\n");
 				goto exit;
 			}
 			ip_pkt = (u8 *)kzalloc(ip_pkt_len, kflags);
@@ -502,6 +506,8 @@ static int aicwf_vendor_logger_start_logging(struct wiphy *wiphy, struct wireles
 	const struct nlattr *iter;
 	struct wifi_ring_buffer_status rb;
 
+	memset(&rb, 0, sizeof(rb));
+
 	nla_for_each_attr(iter, data, len, rem) {
 		type = nla_type(iter);
 		switch (type) {
@@ -518,7 +524,9 @@ static int aicwf_vendor_logger_start_logging(struct wiphy *wiphy, struct wireles
 			size = nla_get_u32(iter);
 			break;
 		case LOGGER_ATTRIBUTE_RING_NAME:
-			strcpy(rb.name, nla_data(iter));
+			/* NLA_STRING is neither length-capped nor NUL-terminated */
+			memset(rb.name, 0, sizeof(rb.name));
+			memcpy(rb.name, nla_data(iter), min_t(int, nla_len(iter), sizeof(rb.name) - 1));
 			break;
 		default:
 			AICWFDBG(LOGERROR, "%s(%d), Unknown type: %d\n", __func__, __LINE__, type);
@@ -548,11 +556,14 @@ static int aicwf_vendor_logger_get_ring_data(struct wiphy *wiphy, struct wireles
 	const struct nlattr *iter;
 	struct wifi_ring_buffer_status rb;
 
+	memset(&rb, 0, sizeof(rb));
+
 	nla_for_each_attr(iter, data, len, rem) {
 		type = nla_type(iter);
 		switch (type) {
 		case LOGGER_ATTRIBUTE_RING_NAME:
-			strcpy(rb.name, nla_data(iter));
+			memset(rb.name, 0, sizeof(rb.name));
+			memcpy(rb.name, nla_data(iter), min_t(int, nla_len(iter), sizeof(rb.name) - 1));
 			break;
 		default:
 			pr_err("%s(%d), Unknown type: %d\n", __func__, __LINE__, type);
