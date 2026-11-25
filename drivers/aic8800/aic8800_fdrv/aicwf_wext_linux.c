@@ -34,6 +34,16 @@
 
 #define MAX_WPA_IE_LEN (256)
 
+/* scan_re->payload holds the whole beacon/probe response frame; the IEs
+ * start at u.beacon.variable, so ind->length overstates the IE length.
+ */
+static inline uint aicwf_scan_ie_len(struct scanu_result_wext *scan_re)
+{
+	uint hdr_len = offsetof(struct ieee80211_mgmt, u.beacon.variable);
+
+	return scan_re->ind->length > hdr_len ? scan_re->ind->length - hdr_len : 0;
+}
+
 
 /*				20/40/80,	ShortGI,	MCS Rate  */
 const u16 VHT_MCS_DATA_RATE[3][2][30] = {
@@ -478,14 +488,14 @@ static inline char *aicwf_get_iwe_stream_protocol(struct rwnx_hw* rwnx_hw,
 
 	/* parsing HT_CAP_IE	 */
 	ie_content = NULL;
-	ie_content = cfg80211_find_ie(WLAN_EID_HT_CAPABILITY, payload, scan_re->ind->length);
+	ie_content = cfg80211_find_ie(WLAN_EID_HT_CAPABILITY, payload, aicwf_scan_ie_len(scan_re));
 	if (ie_content != NULL){
 		ht_cap = true;
 	}
 
 	/* parsing VHT_CAP_IE	 */
 	ie_content = NULL;
-	ie_content = cfg80211_find_ie(WLAN_EID_VHT_CAPABILITY, payload, scan_re->ind->length);
+	ie_content = cfg80211_find_ie(WLAN_EID_VHT_CAPABILITY, payload, aicwf_scan_ie_len(scan_re));
 	if (ie_content != NULL){
 		vht_cap = true;
 	}
@@ -493,7 +503,7 @@ static inline char *aicwf_get_iwe_stream_protocol(struct rwnx_hw* rwnx_hw,
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0)|| defined(CONFIG_HE_FOR_OLD_KERNEL)
 	/* parsing HE_CAP_IE	 */
 	ie_content = NULL;
-	ie_content = cfg80211_find_ie(WLAN_EID_EXTENSION, payload, scan_re->ind->length);
+	ie_content = cfg80211_find_ie(WLAN_EID_EXTENSION, payload, aicwf_scan_ie_len(scan_re));
 	if (ie_content != NULL && ie_content[2] == WLAN_EID_EXT_HE_CAPABILITY){
 		he_cap = true;
 	}
@@ -646,7 +656,7 @@ static inline char *aicwf_get_iwe_stream_rate(struct rwnx_hw* rwnx_hw,
 
 	/* parsing HT_CAP_IE	 */
 	ie_content = NULL;
-	ie_content = cfg80211_find_ie(WLAN_EID_HT_CAPABILITY, payload, scan_re->ind->length);
+	ie_content = cfg80211_find_ie(WLAN_EID_HT_CAPABILITY, payload, aicwf_scan_ie_len(scan_re));
 	if (ie_content != NULL){
 		ht_cap = true;
 		ht_capie = (struct ieee80211_ht_cap *)(ie_content + 2);
@@ -659,7 +669,7 @@ static inline char *aicwf_get_iwe_stream_rate(struct rwnx_hw* rwnx_hw,
 
 	/* parsing VHT_CAP_IE	 */
 	ie_content = NULL;
-	ie_content = cfg80211_find_ie(WLAN_EID_VHT_CAPABILITY, payload, scan_re->ind->length);
+	ie_content = cfg80211_find_ie(WLAN_EID_VHT_CAPABILITY, payload, aicwf_scan_ie_len(scan_re));
 	if (ie_content != NULL){
 		
 		vht_cap = true;
@@ -686,7 +696,7 @@ static inline char *aicwf_get_iwe_stream_rate(struct rwnx_hw* rwnx_hw,
 	/* parsing HE_CAP_IE	 */
 	ie_content = NULL;
 	/*0xFF+len+WLAN_EID_EXTENSION+playload */
-	ie_content = cfg80211_find_ie(WLAN_EID_EXTENSION, payload, scan_re->ind->length);
+	ie_content = cfg80211_find_ie(WLAN_EID_EXTENSION, payload, aicwf_scan_ie_len(scan_re));
 	if (ie_content != NULL && ie_content[2] == WLAN_EID_EXT_HE_CAPABILITY){
 		he_cap = true;
 		he_ch_width_set = ie_content[8];
@@ -753,10 +763,12 @@ int aic_get_sec_ie(u8 *in_ie, uint in_len, u8 *rsn_ie, u16 *rsn_len, u8 *wpa_ie,
 
 	sec_idx = 0;
 
-	while (cnt < in_len) {
+	/* Stop at a truncated element: in_ie[cnt + 1] is the element length. */
+	while (cnt + 2 <= in_len && cnt + 2 + in_ie[cnt + 1] <= in_len) {
 		authmode = in_ie[cnt];
 
-		if ((authmode == 0xdd/*_WPA_IE_ID_*/) && (memcmp(&in_ie[cnt + 2], &wpa_oui[0], 4) == 0)) {
+		if ((authmode == 0xdd/*_WPA_IE_ID_*/) && in_ie[cnt + 1] >= 4 &&
+		    (memcmp(&in_ie[cnt + 2], &wpa_oui[0], 4) == 0)) {
 			if (wpa_ie)
 				memcpy(wpa_ie, &in_ie[cnt], in_ie[cnt + 1] + 2);
 
@@ -788,10 +800,12 @@ static inline char *aicwf_get_iwe_stream_wpa_wpa2(struct rwnx_hw* rwnx_hw,
 {
 	struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt*)scan_re->payload;
 	u8 *payload = mgmt->u.beacon.variable;
-	int buf_size = MAX_WPA_IE_LEN * 2;
+	/* "rsn_ie=" + two hex digits per byte of a 257-byte element + NUL */
+	int buf_size = MAX_WPA_IE_LEN * 2 + 16;
 	u8 *pbuf;
 
-	u8 wpa_ie[255] = {0}, rsn_ie[255] = {0};
+	/* An element is at most 2 header bytes + 255 bytes of body. */
+	u8 wpa_ie[2 + 255] = {0}, rsn_ie[2 + 255] = {0};
 	u16 i, wpa_len = 0, rsn_len = 0;
 	u8 *p;
 	int out_len = 0;
@@ -802,7 +816,7 @@ static inline char *aicwf_get_iwe_stream_wpa_wpa2(struct rwnx_hw* rwnx_hw,
 		p = pbuf;
 
 		/* parsing WPA/WPA2 IE */
-			out_len = aic_get_sec_ie(payload , scan_re->ind->length, rsn_ie, &rsn_len, wpa_ie, &wpa_len);
+			out_len = aic_get_sec_ie(payload, aicwf_scan_ie_len(scan_re), rsn_ie, &rsn_len, wpa_ie, &wpa_len);
 
 			if (wpa_len > 0) {
 
@@ -832,6 +846,7 @@ static inline char *aicwf_get_iwe_stream_wpa_wpa2(struct rwnx_hw* rwnx_hw,
 			if (rsn_len > 0) {
 
 				memset(pbuf, 0, buf_size);
+				p = pbuf;
 				p += sprintf(p, "rsn_ie=");
 				for (i = 0; i < rsn_len; i++)
 					p += sprintf(p, "%02x", rsn_ie[i]);
@@ -884,10 +899,11 @@ static inline char *aicwf_get_iwe_stream_wps(struct rwnx_hw* rwnx_hw,
 	uint wps_ielen = 0;
 	u8 *ie_ptr = payload;
 	
-	total_ielen = scan_re->ind->length;
+	total_ielen = aicwf_scan_ie_len(scan_re);
 	
-	while (cnt < total_ielen) {
-		if (aicwf_get_is_wps_ie(&ie_ptr[cnt], &wps_ielen) && (wps_ielen > 2)) {
+	while (cnt + 2 <= total_ielen && cnt + 2 + ie_ptr[cnt + 1] <= total_ielen) {
+		if (ie_ptr[cnt + 1] >= 4 &&
+		    aicwf_get_is_wps_ie(&ie_ptr[cnt], &wps_ielen) && (wps_ielen > 2)) {
 			wpsie_ptr = &ie_ptr[cnt];
 			iwe->cmd = IWEVGENIE;
 			iwe->u.data.length = (u16)wps_ielen;
