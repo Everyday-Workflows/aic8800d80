@@ -1,0 +1,197 @@
+name: Upstream Sync Check
+
+on:
+  schedule:
+    # Mondays 13:00 UTC (08:00/09:00 America/New_York)
+    - cron: "0 13 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync-upstream:
+    name: Check shenmintao/aic8800d80 for updates
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    outputs:
+      has_updates: ${{ steps.sync.outputs.has_updates }}
+      merge_clean: ${{ steps.sync.outputs.merge_clean }}
+      sync_branch: ${{ steps.sync.outputs.sync_branch }}
+    steps:
+      - name: Checkout fork with full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch upstream and prepare review branch
+        id: sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_URL: https://github.com/shenmintao/aic8800d80.git
+          SYNC_BRANCH: sync/upstream-main
+        run: |
+          set -euo pipefail
+          tmp_dir=$(mktemp -d)
+          trap 'rm -rf "$tmp_dir"' EXIT
+
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --no-tags upstream main
+
+          count=$(git rev-list --count main..upstream/main)
+          upstream_sha=$(git rev-parse upstream/main)
+          upstream_short=$(git rev-parse --short upstream/main)
+
+          echo "sync_branch=$SYNC_BRANCH" >> "$GITHUB_OUTPUT"
+          if [ "$count" -eq 0 ]; then
+            echo "Up to date with shenmintao/aic8800d80 (${upstream_short})."
+            echo "has_updates=false" >> "$GITHUB_OUTPUT"
+            echo "merge_clean=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Upstream sync check"
+              echo "Fork \`main\` already contains upstream \`shenmintao/aic8800d80\` HEAD (\`${upstream_short}\`)."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "has_updates=true" >> "$GITHUB_OUTPUT"
+          git log --oneline main..upstream/main > "$tmp_dir/commits.txt"
+          git diff --stat main...upstream/main > "$tmp_dir/diffstat.txt"
+
+          upsert_issue() {
+            local title="$1"
+            local body_file="$2"
+            local existing
+            gh issue list \
+              --repo "$GITHUB_REPOSITORY" \
+              --state open \
+              --limit 50 \
+              --json number,title > "$tmp_dir/issues.json"
+            existing=$(jq -r --arg t "$title" 'first(.[] | select(.title == $t) | .number) // empty' "$tmp_dir/issues.json")
+            if [ -n "$existing" ]; then
+              gh issue edit "$existing" --repo "$GITHUB_REPOSITORY" --body-file "$body_file"
+              echo "Updated tracking issue #$existing"
+            else
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file "$body_file"
+            fi
+          }
+
+          auth_header=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git checkout -B "$SYNC_BRANCH" main
+          if git -c user.name="github-actions[bot]" \
+                 -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+                 merge --no-edit upstream/main; then
+            echo "merge_clean=true" >> "$GITHUB_OUTPUT"
+
+            # Populate tracking ref if SYNC_BRANCH already exists so --force-with-lease has an expected OID.
+            git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth_header}" \
+              fetch --no-tags origin "refs/heads/${SYNC_BRANCH}:refs/remotes/origin/${SYNC_BRANCH}" 2>/dev/null || true
+            git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth_header}" \
+              push --force-with-lease origin "HEAD:refs/heads/${SYNC_BRANCH}"
+
+            {
+              echo "## Upstream updates from \`shenmintao/aic8800d80\`"
+              echo
+              echo "Found **${count}** new commit(s) up to \`${upstream_short}\` (\`${upstream_sha}\`)."
+              echo "Merged cleanly onto \`${SYNC_BRANCH}\`. **Human review required before merging into \`main\`** — never auto-merge unreviewed kernel code."
+              echo
+              echo "### Review & open PR"
+              echo "- Compare / create PR: https://github.com/${GITHUB_REPOSITORY}/compare/main...${SYNC_BRANCH}?expand=1"
+              echo "- Workflow run (includes CI tests & Arch kernel builds): ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+              echo
+              echo "### Upstream commits"
+              echo '```'
+              cat "$tmp_dir/commits.txt"
+              echo '```'
+              echo
+              echo "### Diff stat vs fork \`main\`"
+              echo '```'
+              cat "$tmp_dir/diffstat.txt"
+              echo '```'
+              echo
+              echo "### After review & merge"
+              echo "1. Verify \`tests/firmware\`, \`tests/rx-defrag\` (ASan), and both Arch kernel builds pass."
+              echo "2. Update \`_commit\` and \`_rev\` in \`~/CachyOS-Linux-Config/templates/aic8800d80/PKGBUILD\` and run its \`install.sh\`."
+            } > "$tmp_dir/body.md"
+
+            existing_pr=$(gh pr list \
+              --repo "$GITHUB_REPOSITORY" \
+              --state open \
+              --head "$SYNC_BRANCH" \
+              --base main \
+              --json number \
+              --jq '.[0].number // empty' || true)
+
+            if [ -n "$existing_pr" ]; then
+              gh pr edit "$existing_pr" \
+                --repo "$GITHUB_REPOSITORY" \
+                --title "chore(sync): upstream shenmintao/aic8800d80 (${upstream_short})" \
+                --body-file "$tmp_dir/body.md"
+            else
+              if ! gh pr create \
+                --repo "$GITHUB_REPOSITORY" \
+                --base main \
+                --head "$SYNC_BRANCH" \
+                --draft \
+                --title "chore(sync): upstream shenmintao/aic8800d80 (${upstream_short})" \
+                --body-file "$tmp_dir/body.md" 2>"$tmp_dir/pr_err.txt"; then
+                cat "$tmp_dir/pr_err.txt" >&2
+                echo "Falling back to tracking issue (org policy may block Actions PR creation)."
+                upsert_issue "Upstream sync ready: shenmintao/aic8800d80" "$tmp_dir/body.md"
+              fi
+            fi
+
+            cat "$tmp_dir/body.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "merge_clean=false" >> "$GITHUB_OUTPUT"
+            git diff --name-only --diff-filter=U > "$tmp_dir/conflicts.txt" || true
+            git merge --abort || true
+
+            {
+              echo "## Upstream sync conflict with \`shenmintao/aic8800d80\`"
+              echo
+              echo "Found **${count}** new commit(s) up to \`${upstream_short}\`, but automatic merge into \`main\` conflicted."
+              echo
+              echo "### Conflicting files"
+              echo '```'
+              cat "$tmp_dir/conflicts.txt"
+              echo '```'
+              echo
+              echo "### New upstream commits"
+              echo '```'
+              cat "$tmp_dir/commits.txt"
+              echo '```'
+              echo
+              echo "### Resolve locally"
+              echo '```sh'
+              echo "cd ~/Projects/aic8800d80"
+              echo "git fetch origin upstream"
+              echo "git switch -c sync/upstream-${upstream_short} origin/main"
+              echo "git merge upstream/main   # resolve conflicts while preserving fork hardening fixes"
+              echo "python3 -m unittest discover -s tests/firmware -v"
+              echo "python3 -m unittest discover -s tests/rx-defrag -v"
+              echo '```'
+            } > "$tmp_dir/conflict_body.md"
+
+            upsert_issue "Upstream sync conflict: shenmintao/aic8800d80" "$tmp_dir/conflict_body.md"
+            cat "$tmp_dir/conflict_body.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  verify-sync:
+    name: Verify synced branch
+    needs: sync-upstream
+    if: needs.sync-upstream.outputs.has_updates == 'true' && needs.sync-upstream.outputs.merge_clean == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.sync-upstream.outputs.sync_branch }}

@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to check out (defaults to workflow ref)
+        required: false
+        type: string
+        default: ""
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  tests:
+    name: Tests (firmware + ASan RX defrag)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Run firmware unit tests
+        run: python3 -m unittest discover -s tests/firmware -v
+
+      - name: Run RX defrag ASan/UBSan tests
+        run: python3 -m unittest discover -s tests/rx-defrag -v
+
+  build-kernels:
+    name: Build modules (${{ matrix.kernel }})
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kernel: arch-linux
+            headers_pkg: linux-headers
+          - kernel: arch-linux-lts
+            headers_pkg: linux-lts-headers
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Compile all 3 DKMS modules against Arch kernel headers
+        env:
+          HEADERS_PKG: ${{ matrix.headers_pkg }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}/drivers/aic8800:/src:ro" \
+            -e HEADERS_PKG="$HEADERS_PKG" \
+            archlinux:base-devel \
+            bash -euo pipefail -c '
+              pacman -Syu --noconfirm --needed "$HEADERS_PKG" bc kmod
+              KVER=$(find /usr/lib/modules -mindepth 1 -maxdepth 1 -type d -printf "%f\n" | sort | tail -n 1)
+              KDIR="/usr/lib/modules/${KVER}/build"
+              echo "Building against kernel: ${KVER}"
+              if grep -q "^CONFIG_CC_IS_CLANG=y" "${KDIR}/include/config/auto.conf" 2>/dev/null; then
+                pacman -S --noconfirm --needed clang lld llvm
+              fi
+              cp -a /src /tmp/aic8800-build
+              if ! make -C /tmp/aic8800-build -j"$(nproc)" KVER="${KVER}" KDIR="${KDIR}" > /tmp/build.log 2>&1; then
+                cat /tmp/build.log
+                exit 1
+              fi
+              cat /tmp/build.log
+              for mod in \
+                /tmp/aic8800-build/aic_load_fw/aic_load_fw.ko \
+                /tmp/aic8800-build/aic8800_fdrv/aic8800_fdrv.ko \
+                /tmp/aic8800-build/aic_zlp_quirk/aic_zlp_quirk.ko; do
+                test -f "$mod" || { echo "Missing module: $mod" >&2; exit 1; }
+                modinfo -F vermagic "$mod"
+              done
+              if grep -iE "warning:|WARNING:" /tmp/build.log; then
+                echo "Build emitted compiler/modpost warnings" >&2
+                exit 1
+              fi
+            '
